@@ -5,6 +5,8 @@ All notable changes to this project are documented here, in the
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-29
+
 ### Added
 
 - A bot that gives each operator a direct Matrix room and writes its alert URL into their Beszel notification settings, keeping the URL's token current.
