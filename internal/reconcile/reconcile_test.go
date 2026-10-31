@@ -113,7 +113,9 @@ func (e *env) handle(body string) {
 	if err := json.Unmarshal([]byte(body), &r); err != nil {
 		e.t.Fatal(err)
 	}
-	e.n.Handle(context.Background(), &r, false)
+	if err := e.n.Handle(context.Background(), &r, false); err != nil {
+		e.t.Fatalf("handle: %v", err)
+	}
 }
 
 func TestANewOperatorGetsARoomAndAURL(t *testing.T) {
@@ -414,5 +416,107 @@ func TestLogsNameNoSecret(t *testing.T) {
 	b, _ := json.Marshal(e.rec(alice))
 	if strings.Contains(string(b), e.b.Token()) {
 		t.Fatal("a user record holds the token")
+	}
+}
+
+// The hub answers a request made with an expired or revoked token as a
+// guest's, with no users rather than an error. A pass must not read that as
+// every operator gone and leave their rooms.
+func TestAnExpiredHubTokenLeavesNoRoom(t *testing.T) {
+	e := newEnv(t)
+	alice := e.operator("alice@example.org", "alice", "sub-a")
+	e.pass()
+	room := e.rec(alice).Room
+	e.hub.ExpireTokens()
+	e.pass()
+	if rec := e.rec(alice); rec.Room != room || rec.OptedOut {
+		t.Fatalf("record %+v", rec)
+	}
+	if e.room(room).Left {
+		t.Fatal("the room was left")
+	}
+	if e.hub.SignIns() != 2 {
+		t.Fatalf("sign ins %d, want 2", e.hub.SignIns())
+	}
+}
+
+func TestAPassWaitsForTheHub(t *testing.T) {
+	e := newEnv(t)
+	alice := e.operator("alice@example.org", "alice", "sub-a")
+	e.pass()
+	before := e.rec(alice)
+	sends := len(e.syn.Sends())
+	e.hub.Down.Store(true)
+	if err := e.n.Pass(context.Background()); err == nil {
+		t.Fatal("a pass without the hub succeeded")
+	}
+	if rec := e.rec(alice); rec != before || e.room(rec.Room).Left || len(e.syn.Sends()) != sends {
+		t.Fatalf("record %+v, left %v, sends %d", rec, e.room(rec.Room).Left, len(e.syn.Sends()))
+	}
+}
+
+func TestABatchWaitsForTheHub(t *testing.T) {
+	e := newEnv(t)
+	alice := e.operator("alice@example.org", "alice", "sub-a")
+	e.pass()
+	room := e.rec(alice).Room
+	var r matrix.SyncResponse
+	if err := json.Unmarshal([]byte(`{"rooms":{"join":{"`+room+`":{"timeline":{"events":[
+		{"type":"m.room.member","sender":"@alice:example.org","state_key":"@alice:example.org","event_id":"$l","content":{"membership":"leave"}}]}}}}}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	e.hub.Down.Store(true)
+	if err := e.n.Handle(context.Background(), &r, false); err == nil {
+		t.Fatal("a batch was handled without the hub")
+	}
+	if rec := e.rec(alice); rec.OptedOut || rec.Room != room {
+		t.Fatalf("record %+v", rec)
+	}
+	e.hub.Down.Store(false)
+	if err := e.n.Handle(context.Background(), &r, false); err != nil {
+		t.Fatal(err)
+	}
+	if rec := e.rec(alice); !rec.OptedOut {
+		t.Fatalf("record %+v", rec)
+	}
+}
+
+// Listen keeps its sync position while the hub is away, so the batch it
+// could not act on comes again once the hub is back.
+func TestListenHoldsItsPositionUntilTheHubIsBack(t *testing.T) {
+	e := newEnv(t)
+	alice := e.operator("alice@example.org", "alice", "sub-a")
+	e.pass()
+	room := e.rec(alice).Room
+	if err := e.st.Update(func(d *state.Data) error { d.Bot.SyncToken = "s0"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	e.syn.QueueSync("s1", `{"rooms":{"join":{"`+room+`":{"timeline":{"events":[
+		{"type":"m.room.member","sender":"@alice:example.org","state_key":"@alice:example.org","event_id":"$l","content":{"membership":"leave"}}]}}}}}`)
+	e.hub.Down.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = e.n.Listen(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	waitFor(t, func() bool { return len(e.syn.SyncSince()) >= 2 })
+	if got := e.syn.SyncSince(); slices.Contains(got, "s1") || e.st.Snapshot().Bot.SyncToken != "s0" {
+		t.Fatalf("the position moved past an unhandled batch: since %v, saved %q", got, e.st.Snapshot().Bot.SyncToken)
+	}
+	if e.rec(alice).OptedOut {
+		t.Fatal("acted without the hub")
+	}
+	e.hub.Down.Store(false)
+	waitFor(t, func() bool { return e.rec(alice).OptedOut })
+	waitFor(t, func() bool { return e.st.Snapshot().Bot.SyncToken == "s1" })
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

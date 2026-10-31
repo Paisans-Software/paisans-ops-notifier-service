@@ -52,7 +52,8 @@ func commandOf(body string, reply bool) string {
 
 // Listen long-polls /sync as the bot until ctx ends, keeping the sync
 // position in the state file after each batch. It retries every error with a
-// wait that doubles from 1s to 1 minute.
+// wait that doubles from 1s to 1 minute; a batch Handle could not act on
+// leaves the position where it was, so the same batch is asked for again.
 func (n *Notifier) Listen(ctx context.Context) error {
 	since := n.st.Snapshot().Bot.SyncToken
 	initial := since == ""
@@ -61,7 +62,9 @@ func (n *Notifier) Listen(ctx context.Context) error {
 		var resp *matrix.SyncResponse
 		err := n.bot.Call(ctx, func() (e error) { resp, e = n.bot.M.Sync(ctx, since, syncTimeout); return })
 		if err == nil {
-			n.Handle(ctx, resp, initial)
+			err = n.Handle(ctx, resp, initial)
+		}
+		if err == nil {
 			if resp.NextBatch != "" {
 				next := resp.NextBatch
 				err = n.st.Update(func(d *state.Data) error { d.Bot.SyncToken = next; return nil })
@@ -89,15 +92,22 @@ func (n *Notifier) Listen(ctx context.Context) error {
 
 // Handle acts on one /sync batch. With initial set only invitations are
 // answered: the timeline of a first sync is history. An event that fails is
-// logged and skipped; the next pass repairs what it left.
-func (n *Notifier) Handle(ctx context.Context, r *matrix.SyncResponse, initial bool) {
+// logged and skipped; the next pass repairs what it left. A batch with
+// anything to act on waits for the hub: when the hub cannot be signed in to,
+// Handle acts on nothing and returns the error, so the batch comes again.
+func (n *Notifier) Handle(ctx context.Context, r *matrix.SyncResponse, initial bool) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if actionable(r, initial) {
+		if err := n.hubReady(ctx); err != nil {
+			return err
+		}
+	}
 	for room, inv := range r.Rooms.Invite {
 		n.invite(ctx, room, inv.InviteState.Events)
 	}
 	if initial {
-		return
+		return nil
 	}
 	for room, j := range r.Rooms.Join {
 		for _, ev := range j.Timeline.Events {
@@ -107,6 +117,26 @@ func (n *Notifier) Handle(ctx context.Context, r *matrix.SyncResponse, initial b
 	for room := range r.Rooms.Leave {
 		n.botLeft(ctx, room)
 	}
+	return nil
+}
+
+// actionable reports whether Handle would look at anything in r.
+func actionable(r *matrix.SyncResponse, initial bool) bool {
+	if len(r.Rooms.Invite) > 0 {
+		return true
+	}
+	if initial {
+		return false
+	}
+	if len(r.Rooms.Leave) > 0 {
+		return true
+	}
+	for _, j := range r.Rooms.Join {
+		if len(j.Timeline.Events) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // byRoom is the user whose room or pending room is room.
