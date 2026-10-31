@@ -5,6 +5,8 @@ All notable changes to this project are documented here, in the
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-31
+
 ### Fixed
 
 - The bot keeps every operator's room when the hub's superuser token expires, a day after start: it signs in again and acts on nothing until the hub takes it.
