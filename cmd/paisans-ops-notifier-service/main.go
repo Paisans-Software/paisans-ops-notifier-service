@@ -119,6 +119,26 @@ func serve() error {
 	}
 	slog.Info("started", "bot", b.UserID())
 
+	// The hub may still be starting, or the service may have been stopped
+	// for longer than a token lives. Nothing runs until the hub takes a
+	// fresh superuser sign in: a token it no longer takes reads as a
+	// guest's, whose list of users is empty.
+	for wait := time.Second; ; wait = min(wait*2, 5*time.Minute) {
+		err := hub.EnsureAuth(ctx)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		slog.Warn("the Beszel hub could not be signed in to; retrying", "reason", hubReason(err), "retry_in", wait.String())
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+	}
+
 	n := reconcile.New(reconcile.Config{Host: cfg.MatrixHost, ServerName: cfg.ServerName, Provider: cfg.MASProvider,
 		Operators: cfg.Operators, Keep: cfg.KeepEmails}, b, a, hub, st)
 	go func() { _ = n.Listen(ctx) }()
@@ -157,6 +177,17 @@ func startReason(err error) string {
 	var me *matrix.Error
 	if errors.As(err, &me) {
 		return me.Error()
+	}
+	return "internal error"
+}
+
+func hubReason(err error) string {
+	if errors.Is(err, beszel.ErrUnavailable) {
+		return "beszel hub unavailable"
+	}
+	var se *beszel.StatusError
+	if errors.As(err, &se) {
+		return se.Error()
 	}
 	return "internal error"
 }

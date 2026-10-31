@@ -8,6 +8,7 @@ package beszel
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,13 +66,27 @@ func (s Settings) WithWebhooks(w []string) Settings {
 	return Settings{ID: s.ID, Raw: raw}
 }
 
+// expiryMargin is how long before its exp a token stops being used: signing
+// in again then costs one request, and sending it late costs a guest's
+// answer.
+const expiryMargin = 5 * time.Minute
+
 // Client talks to one hub.
+//
+// PocketBase reads an expired or revoked token as a guest's and answers a
+// guest's list of an owner only collection with no items, not a refusal
+// (v0.40.5 apis/middlewares.go loadAuthToken). An answer is therefore only
+// as good as the token it was asked with: the client never sends a token
+// past its exp, and EnsureAuth proves the token before a caller trusts what
+// the hub says.
 type Client struct {
 	base, email, password string
 	hc                    *http.Client
+	now                   func() time.Time
 
 	mu    sync.Mutex
 	token string
+	exp   time.Time // zero when the token's exp could not be read
 }
 
 // New returns a client for the hub at baseURL. A nil hc gets a 15 second timeout.
@@ -79,7 +94,72 @@ func New(baseURL, email, password string, hc *http.Client) *Client {
 	if hc == nil {
 		hc = &http.Client{Timeout: 15 * time.Second}
 	}
-	return &Client{base: strings.TrimRight(baseURL, "/"), email: email, password: password, hc: hc}
+	return &Client{base: strings.TrimRight(baseURL, "/"), email: email, password: password, hc: hc, now: time.Now}
+}
+
+// expiry is the exp claim of a JWT, read without verifying it; zero when
+// there is none.
+func expiry(token string) time.Time {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}
+	}
+	b, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp json.Number `json:"exp"`
+	}
+	if json.Unmarshal(b, &claims) != nil {
+		return time.Time{}
+	}
+	sec, err := claims.Exp.Int64()
+	if err != nil || sec <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(sec, 0)
+}
+
+func (c *Client) setToken(token string) {
+	c.mu.Lock()
+	c.token, c.exp = token, expiry(token)
+	c.mu.Unlock()
+}
+
+// current is the token to send, "" when there is none or it is at or near
+// its exp.
+func (c *Client) current() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.token == "" || (!c.exp.IsZero() && !c.now().Before(c.exp.Add(-expiryMargin))) {
+		return ""
+	}
+	return c.token
+}
+
+// EnsureAuth proves the client holds a superuser token the hub takes,
+// renewing it through auth-refresh, and signs in again when the hub refuses
+// it or it is at or near its exp. Callers check it before acting on what the
+// hub says, since a guest's answers are empty rather than errors.
+func (c *Client) EnsureAuth(ctx context.Context) error {
+	if tok := c.current(); tok != "" {
+		var out struct {
+			Token string `json:"token"`
+		}
+		_, err := c.send(ctx, http.MethodPost, "/api/collections/_superusers/auth-refresh", "superuser refresh", nil, &out, tok)
+		switch {
+		case err == nil && out.Token != "":
+			c.setToken(out.Token)
+			return nil
+		case err == nil:
+			return nil
+		case !IsStatus(err, http.StatusUnauthorized) && !IsStatus(err, http.StatusForbidden) && !IsStatus(err, http.StatusNotFound):
+			return err
+		}
+	}
+	_, err := c.authenticate(ctx)
+	return err
 }
 
 // StatusError is a refusal: a 4xx answer.
@@ -156,18 +236,15 @@ func (c *Client) authenticate(ctx context.Context) (string, error) {
 	if out.Token == "" {
 		return "", errors.New("beszel superuser sign in: answer without a token")
 	}
-	c.mu.Lock()
-	c.token = out.Token
-	c.mu.Unlock()
+	c.setToken(out.Token)
 	return out.Token, nil
 }
 
 // do sends an authenticated request, signing in first when there is no
-// token and once more when the hub refuses the one it has.
+// token or it is at or near its exp, and once more when the hub refuses the
+// one it has.
 func (c *Client) do(ctx context.Context, method, path, op string, body, out any) error {
-	c.mu.Lock()
-	tok := c.token
-	c.mu.Unlock()
+	tok := c.current()
 	if tok == "" {
 		var err error
 		if tok, err = c.authenticate(ctx); err != nil {

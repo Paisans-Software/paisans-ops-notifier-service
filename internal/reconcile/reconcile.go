@@ -85,6 +85,9 @@ func (n *Notifier) isOperator(email string) bool {
 func (n *Notifier) Pass(ctx context.Context) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
+	if err := n.hubReady(ctx); err != nil {
+		return err
+	}
 	users, err := n.hub.Users(ctx)
 	if err != nil {
 		return fmt.Errorf("list the hub's users: %w", err)
@@ -123,13 +126,27 @@ func (n *Notifier) Pass(ctx context.Context) error {
 			continue
 		}
 		// The user is gone from the hub: deleted by hand, or by an
-		// offboard whose state write failed.
+		// offboard whose state write failed. hubReady proved the list was
+		// a superuser's, not a guest's empty one.
+		slog.Info("a Beszel user is gone from the hub; leaving their room", "user", id, "room", rec.Room)
 		n.leaveRooms(ctx, rec.Room, rec.PendingRoom)
 		if err := n.st.Update(func(d *state.Data) error { delete(d.Users, id); return nil }); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// hubReady proves the hub takes the service's superuser token, signing in
+// again when it does not. Nothing the hub says is acted on before it: with a
+// token it no longer takes, PocketBase answers as to a guest, and a guest's
+// list of users is empty rather than refused.
+func (n *Notifier) hubReady(ctx context.Context) error {
+	if err := n.hub.EnsureAuth(ctx); err != nil {
+		slog.Warn("the Beszel hub could not be signed in to; waiting for it", "reason", reason(err))
+		return fmt.Errorf("sign in to the hub: %w", err)
+	}
+	return nil
 }
 
 // offboard deletes a Beszel user who is no longer an operator, and their
