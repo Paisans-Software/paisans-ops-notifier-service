@@ -28,6 +28,12 @@ service beside the deployment's Matrix homeserver.
     answered with a fresh room of the bot's) and asks for `subscribe`;
   * any other invitation is rejected.
 
+Nothing runs until the hub takes the service's superuser sign in, and each
+pass, and each `/sync` batch with anything in it, proves the sign in again
+first. PocketBase answers a request whose token has expired as a guest's,
+with no users rather than an error, so an answer from an unproven token is
+never acted on. A batch that waits keeps the `/sync` position where it was.
+
 Operators are matched by email against `OPS_NOTIFIER_OPERATOR_EMAILS`. A user
 with no Pocket ID sign in, and every address in `OPS_NOTIFIER_KEEP_EMAILS`
 (the hub's break glass user), is never touched. The service refuses to start

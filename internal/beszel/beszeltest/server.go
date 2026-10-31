@@ -1,8 +1,14 @@
 // Package beszeltest is a fake Beszel hub speaking the slice of the
 // PocketBase records API the service uses, as one superuser.
+//
+// Like PocketBase v0.40.5, it treats a request whose token is unknown,
+// revoked or expired as a guest's, not as an error (apis/middlewares.go
+// loadAuthToken): a guest listing a collection whose rule is owner only gets
+// 200 and no items. Only auth-refresh refuses a guest, with 401.
 package beszeltest
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Server is the fake.
@@ -22,22 +29,27 @@ type Server struct {
 	Password string
 	// Down makes every route answer 503.
 	Down atomic.Bool
+	// TokenTTL is the life of a token from sign in or refresh: PocketBase's
+	// default for _superusers, one day, unless set.
+	TokenTTL time.Duration
 
-	mu       sync.Mutex
-	seq      int
-	tokens   map[string]bool
-	users    map[string]map[string]any
-	auths    []map[string]any
-	settings map[string]map[string]any // record id → record
-	signIns  int
-	deleted  []string
+	mu        sync.Mutex
+	seq       int
+	tokens    map[string]time.Time // token → expiry
+	refreshes int
+	guests    int
+	users     map[string]map[string]any
+	auths     []map[string]any
+	settings  map[string]map[string]any // record id → record
+	signIns   int
+	deleted   []string
 }
 
 // New starts a fake hub closed when the test ends.
 func New(t testing.TB) *Server {
 	t.Helper()
-	s := &Server{Email: "paisans-link-notify@example.org", Password: "hub-password",
-		tokens: map[string]bool{}, users: map[string]map[string]any{}, settings: map[string]map[string]any{}}
+	s := &Server{Email: "paisans-link-notify@example.org", Password: "hub-password", TokenTTL: 24 * time.Hour,
+		tokens: map[string]time.Time{}, users: map[string]map[string]any{}, settings: map[string]map[string]any{}}
 	srv := httptest.NewServer(http.HandlerFunc(s.handle))
 	t.Cleanup(srv.Close)
 	s.URL = srv.URL
@@ -124,11 +136,44 @@ func (s *Server) SignIns() int {
 	return s.signIns
 }
 
-// ExpireTokens forgets every token, so the next request is refused.
+// ExpireTokens forgets every token, so the next request made with one is a
+// guest's.
 func (s *Server) ExpireTokens() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.tokens = map[string]bool{}
+	s.tokens = map[string]time.Time{}
+}
+
+// Refreshes counts the auth-refresh requests that renewed a token.
+func (s *Server) Refreshes() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refreshes
+}
+
+// GuestRequests counts the record requests made without a valid token.
+func (s *Server) GuestRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.guests
+}
+
+// issue mints a token shaped like PocketBase's: a JWT whose payload carries
+// exp, unsigned since the client never verifies it.
+func (s *Server) issue() string {
+	s.seq++
+	exp := time.Now().Add(s.TokenTTL)
+	enc := base64.RawURLEncoding
+	payload, _ := json.Marshal(map[string]any{"exp": exp.Unix(), "type": "auth", "refreshable": true, "n": s.seq})
+	tok := enc.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc.EncodeToString(payload) + ".sig"
+	s.tokens[tok] = exp
+	return tok
+}
+
+// valid reports whether the request carries a known, unexpired token.
+func (s *Server) valid(r *http.Request) bool {
+	exp, ok := s.tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+	return ok && time.Now().Before(exp)
 }
 
 func (s *Server) settingsOf(user string) map[string]any {
@@ -138,6 +183,25 @@ func (s *Server) settingsOf(user string) map[string]any {
 		}
 	}
 	return nil
+}
+
+// guest answers a request without a valid token as PocketBase does under
+// Beszel v0.21.1's rules: a list is empty (owner only list rules), a
+// settings create fails its rule (400), a settings update finds nothing
+// (404), and a user delete is for superusers only (403).
+func (s *Server) guest(w http.ResponseWriter, r *http.Request) {
+	rest, _ := strings.CutPrefix(r.URL.Path, "/api/collections/")
+	parts := strings.Split(rest, "/")
+	switch {
+	case r.Method == http.MethodGet && len(parts) == 2 && parts[1] == "records":
+		writeJSON(w, 200, map[string]any{"page": 1, "totalPages": 0, "items": []any{}})
+	case r.Method == http.MethodPost:
+		writeJSON(w, 400, map[string]any{})
+	case r.Method == http.MethodDelete:
+		writeJSON(w, 403, map[string]any{"message": "Only superusers can perform this action."})
+	default:
+		writeJSON(w, 404, map[string]any{})
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -181,13 +245,22 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.signIns++
-		tok := fmt.Sprintf("tok%d", s.signIns)
-		s.tokens[tok] = true
-		writeJSON(w, 200, map[string]any{"token": tok})
+		writeJSON(w, 200, map[string]any{"token": s.issue()})
 		return
 	}
-	if !s.tokens[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")] {
-		writeJSON(w, 401, map[string]any{"message": "The request requires valid record authorization token."})
+	authed := s.valid(r)
+	if r.Method == http.MethodPost && r.URL.Path == "/api/collections/_superusers/auth-refresh" {
+		if !authed {
+			writeJSON(w, 401, map[string]any{"message": "The request requires valid record authorization token."})
+			return
+		}
+		s.refreshes++
+		writeJSON(w, 200, map[string]any{"token": s.issue()})
+		return
+	}
+	if !authed {
+		s.guests++
+		s.guest(w, r)
 		return
 	}
 	rest, ok := strings.CutPrefix(r.URL.Path, "/api/collections/")
